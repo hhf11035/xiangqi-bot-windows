@@ -1,3 +1,6 @@
 *.DS_Store
 ss_*.png
 screen.png
+
+# Training screenshots: tens of thousands of files, they do not belong in git.
+cnn_data/
