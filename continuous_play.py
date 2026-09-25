@@ -12,15 +12,15 @@ that plays games back-to-back:
 
 Does NOT modify xiangqi_bot.py or app.py. If this script misbehaves,
 fall back to:
-  python3 xiangqi_bot.py    # single-game CLI
-  python3 app.py            # single-game GUI
+  python3 xiangqi_bot.py    # single-game CLI (or 启动单局.bat on Windows)
+  python3 app.py            # macOS-only single-game GUI
 
 Subcommands:
   python3 continuous_play.py play [--max-games N] [--recovery-timeout S]
   python3 continuous_play.py test-templates
   python3 continuous_play.py detect-end
   python3 continuous_play.py diag
-  python3 continuous_play.py crop-templates   (manual Preview.app workflow printed)
+  python3 continuous_play.py crop-templates   (manual image-editor workflow printed)
 """
 
 import argparse
@@ -37,7 +37,6 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-import Quartz
 
 from xiangqi_bot import Bot
 
@@ -115,13 +114,18 @@ def log(tag, msg):
 
 
 def _send_escape_key():
-    """Post ESC key down + up via Quartz."""
+    """Send Escape through the Bot's cross-platform input layer."""
     try:
-        down = Quartz.CGEventCreateKeyboardEvent(None, ESC_KEYCODE, True)
-        up = Quartz.CGEventCreateKeyboardEvent(None, ESC_KEYCODE, False)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
-        time.sleep(0.05)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        if sys.platform == "darwin":
+            import Quartz
+            down = Quartz.CGEventCreateKeyboardEvent(None, ESC_KEYCODE, True)
+            up = Quartz.CGEventCreateKeyboardEvent(None, ESC_KEYCODE, False)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+            time.sleep(0.05)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        else:
+            import pyautogui
+            pyautogui.press("esc")
     except Exception as e:
         log("key", f"ESC send failed: {e}")
 
@@ -612,26 +616,10 @@ class RecoveryOrchestrator:
             return False
 
     def _window_width(self):
-        try:
-            windows = Quartz.CGWindowListCopyWindowInfo(
-                Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-            for w in windows:
-                if w.get("kCGWindowNumber") == self.bot.win_id:
-                    return int(w["kCGWindowBounds"]["Width"])
-        except Exception:
-            pass
-        return 1628
+        return self.bot._get_window_width()
 
     def _window_height(self):
-        try:
-            windows = Quartz.CGWindowListCopyWindowInfo(
-                Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-            for w in windows:
-                if w.get("kCGWindowNumber") == self.bot.win_id:
-                    return int(w["kCGWindowBounds"]["Height"])
-        except Exception:
-            pass
-        return 960
+        return self.bot._get_window_height()
 
     def recover_to_next_game(self, deadline_ts):
         """Tiered recovery. Return True if board becomes visible in time."""
@@ -959,7 +947,7 @@ def cmd_diag(args):
 
 def cmd_crop_templates(args):
     print("=" * 60)
-    print("Manual cropping workflow (Preview.app)")
+    print("Manual cropping workflow")
     print("=" * 60)
     print()
     print("The script auto-detects templates in:")
@@ -968,13 +956,11 @@ def cmd_crop_templates(args):
     print("To create them manually (5 minutes total):")
     print()
     print("For each template below:")
-    print("  1. Open the source PNG in Preview.app")
-    print("  2. Press K to get rectangular selection")
-    print("  3. Drag a box around the button (tight, 2-3px padding)")
-    print("  4. Cmd+C to copy")
-    print("  5. Cmd+N to make new image from clipboard")
-    print("  6. Cmd+Shift+S to save, pick PNG format,")
-    print("     save to the templates directory above with the exact name below")
+    print("  1. Open the source PNG in an image editor")
+    print("  2. Select the button tightly (2-3px padding)")
+    print("  3. Crop or copy the selection to a new image")
+    print("  4. Save as PNG in the templates directory above")
+    print("     using the exact filename shown below")
     print()
     inventory = [
         ("btn_play_again.png",      "end.png",         "右下 '再来一局' 按钮"),
@@ -994,7 +980,8 @@ def cmd_crop_templates(args):
     print("★ = required for best results; unmarked = optional")
     print()
     print("After cropping, verify with:")
-    print("  python3 continuous_play.py test-templates")
+    print("  py continuous_play.py test-templates  (Windows)")
+    print("  python3 continuous_play.py test-templates  (macOS)")
     print()
     print("Note: the script runs fine without ANY templates — it just falls")
     print("back to blind coordinates + ESC. Templates improve reliability.")

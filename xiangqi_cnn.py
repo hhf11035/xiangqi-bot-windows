@@ -422,7 +422,6 @@ if __name__ == '__main__':
         # Collect from current board position (must have bot running or calibrated)
         print("Collecting data from initial position...")
         # Import bot for screenshot and calibration
-        sys.path.insert(0, '/tmp')
         from xiangqi_bot import Bot, INIT_RED, INIT_BLACK
 
         bot = Bot()
@@ -458,7 +457,6 @@ if __name__ == '__main__':
             sys.exit(1)
 
         print("Testing CNN on current board...")
-        sys.path.insert(0, '/tmp')
         from xiangqi_bot import Bot
 
         bot = Bot()

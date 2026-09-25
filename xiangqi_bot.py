@@ -4,30 +4,48 @@ Xiangqi Bot - Auto-play 天天象棋 using Pikafish engine.
 
 Usage:
   1. Open 天天象棋 in WeChat, start a game (initial position)
-  2. python3 /tmp/xiangqi_bot.py
-  3. Follow the calibration prompts (move mouse to 2 corners)
-  4. Bot auto-plays! Ctrl+C to stop.
+  2. Run xiangqi_bot.py (or 启动单局.bat on Windows)
+  3. Calibration is automatic; follow the prompts only if it falls back to manual mode
+  4. Bot auto-plays. Press Ctrl+C to stop.
 """
 
 import subprocess
 import sys
 import time
 import os
+import queue
+import random
+import threading
+import ctypes
 import numpy as np
 import cv2
 import pyautogui
-import Quartz
+from platform_adapter import WindowAdapter
 
 pyautogui.FAILSAFE = True  # Move mouse to corner to abort
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PIKAFISH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pikafish")
-PIKAFISH_DIR = os.path.dirname(os.path.abspath(__file__))
+PIKAFISH = os.environ.get("PIKAFISH_PATH", os.path.join(
+    _SCRIPT_DIR, "pikafish.exe" if os.name == "nt" else "pikafish"))
+PIKAFISH_DIR = os.path.dirname(os.path.abspath(PIKAFISH))
 TEMPLATE_DIR = os.path.join(_SCRIPT_DIR, "templates")
 SCREENSHOT_PATH = os.path.join(_SCRIPT_DIR, "screen.png")
 CALIB_PATH = os.path.join(_SCRIPT_DIR, "calib.json")
-MOVE_TIME_MS = 500  # Fast for real games with time pressure
+DIAGNOSTIC_DIR = os.path.join(_SCRIPT_DIR, "故障诊断记录")
+DIAGNOSTICS_ENABLED = os.environ.get("XIANGQI_DIAGNOSTICS") == "1"
+MOVE_TIME_MS = 2500  # More reliable tactical search with a practical response time
+ENDGAME_MOVE_TIME_MS = 6500
+LATE_MIDDLEGAME_MOVE_TIME_MS = 4000
 SEARCH_DEPTH = 0    # 0 = unlimited (use movetime), >0 = limit search depth
+ENGINE_TIMEOUT_S = 10.0
+ENGINE_THREADS = 4
+ENGINE_HASH_MB = 512
+ENGINE_MULTIPV = 1
+TURN_POLL_INTERVAL_S = 0.5
+TURN_WAIT_TIMEOUT_S = 150.0
+MOVE_DELAY_MIN_S = 2.0
+MOVE_DELAY_MAX_S = 10.0
+CALIB_VERSION = 2
 
 # Initial board layouts (screen space)
 INIT_RED = [
@@ -69,44 +87,96 @@ class Bot:
         self.win_y = 0
         self.cnn = None  # CNN classifier (loaded on demand)
         self.stop_flag = False  # Set to True to stop the bot
+        self.move_delay_enabled = False
+        self.observer_mode = os.environ.get('XIANGQI_OBSERVER') == '1'
+        self.calib_ratios = None
+        self.platform = WindowAdapter()
+        self._engine_proc = None
+        self._engine_lines = None
+        self._engine_reader = None
+        self._engine_lock = threading.Lock()
+        self._last_stability_image = None
+
+    def _save_failure_diagnostics(self, reason, images=None, metadata=None):
+        """Best-effort failure bundle; diagnostics must never affect play."""
+        if not DIAGNOSTICS_ENABLED:
+            return None
+        try:
+            import json
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            millis = int((time.time() % 1) * 1000)
+            safe_reason = ''.join(
+                ch if ch.isalnum() or ch in '-_' else '_'
+                for ch in str(reason))[:48]
+            bundle_dir = os.path.join(
+                DIAGNOSTIC_DIR, f"{stamp}_{millis:03d}_{safe_reason}")
+            os.makedirs(bundle_dir, exist_ok=False)
+
+            record = {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": str(reason),
+                "playing_red": self.playing_red,
+                "window": {
+                    "x": self.win_x, "y": self.win_y,
+                    "width": getattr(self.platform, 'width', None),
+                    "height": getattr(self.platform, 'height', None),
+                    "retina_scale": self.retina_scale,
+                },
+                "calibration_ratios": list(self.calib_ratios)
+                if self.calib_ratios else None,
+                "metadata": metadata or {},
+            }
+            with open(os.path.join(bundle_dir, "record.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2,
+                          default=str)
+            for name, image in (images or {}).items():
+                if image is None or not hasattr(image, 'shape'):
+                    continue
+                safe_name = ''.join(
+                    ch if ch.isalnum() or ch in '-_' else '_'
+                    for ch in str(name))[:48]
+                image_path = os.path.join(bundle_dir, f"{safe_name}.png")
+                encoded, payload = cv2.imencode(".png", image)
+                if encoded:
+                    payload.tofile(image_path)  # supports Chinese Windows paths
+            print(f"  Diagnostic bundle saved: {bundle_dir}")
+            return bundle_dir
+        except Exception as exc:
+            print(f"  Diagnostic save skipped: {exc}")
+            return None
 
     # --- Window & Screenshot ---
 
     def find_window(self):
-        import Quartz
-        windows = Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-        for w in windows:
-            if 'WeChat' in w.get('kCGWindowOwnerName', '') and \
-               '天天象棋' in w.get('kCGWindowName', ''):
-                self.win_id = w['kCGWindowNumber']
-                b = w['kCGWindowBounds']
-                self.win_x, self.win_y = int(b['X']), int(b['Y'])
-                lw = int(b['Width'])
-                print(f"  Window: id={self.win_id} pos=({self.win_x},{self.win_y}) "
-                      f"size={lw}x{int(b['Height'])}")
-                return
-        raise RuntimeError("天天象棋 window not found!")
+        self.platform.find_wechat_xiangqi()
+        self.win_id = self.platform.win_id
+        self.win_x, self.win_y = self.platform.x, self.platform.y
+        print(f"  Window: id={self.win_id} pos=({self.win_x},{self.win_y}) size={self.platform.width}x{self.platform.height}")
 
     def screenshot_for_processing(self):
         """Capture window, return image. Uses unique filename each time."""
-        self._ss_counter = getattr(self, '_ss_counter', 0) + 1
-        path = os.path.join(_SCRIPT_DIR, f"ss_{self._ss_counter % 3}.png")
-        subprocess.run(['screencapture', '-x', '-o', '-l', str(self.win_id),
-                        path], capture_output=True, check=True)
-        full = cv2.imread(path)
-        if full is None:
-            raise RuntimeError("Screenshot failed!")
-        # Determine retina scale from window capture
-        import Quartz
-        windows = Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-        for w in windows:
-            if w.get('kCGWindowNumber') == self.win_id:
-                lw = int(w['kCGWindowBounds']['Width'])
-                self.retina_scale = full.shape[1] / lw
-                break
+        full = self.platform.screenshot()
+        self.win_x, self.win_y = self.platform.x, self.platform.y
+        self.retina_scale = full.shape[1] / max(1, self.platform.width)
+        self._refresh_grid_from_ratios()
         return full
+
+    def _refresh_grid_from_ratios(self):
+        """Keep calibrated grid coordinates aligned after a window move/resize."""
+        if not self.calib_ratios:
+            return
+        rx1, ry1, rx2, ry2 = self.calib_ratios
+        win_w, win_h = self.platform.width, self.platform.height
+        if win_w <= 0 or win_h <= 0:
+            return
+        x1, y1 = self.win_x + rx1 * win_w, self.win_y + ry1 * win_h
+        x2, y2 = self.win_x + rx2 * win_w, self.win_y + ry2 * win_h
+        self.cell_w = (x2 - x1) / 8.0
+        self.cell_h = (y2 - y1) / 9.0
+        self.cols_logical = [x1 + i * self.cell_w for i in range(9)]
+        self.rows_logical = [y1 + j * self.cell_h for j in range(10)]
+        self.calib_ratios = (rx1, ry1, rx2, ry2)
 
     def logical_to_pixel(self, lx, ly):
         """Convert logical screen coords to full-res pixel coords in window capture."""
@@ -128,9 +198,14 @@ class Bot:
         win_w = self._get_window_width()
         win_h = self._get_window_height()
 
-        # Default ratios from known 天天象棋 layout
-        DEFAULT_RX1, DEFAULT_RY1 = 0.2985, 0.1344
-        DEFAULT_RX2, DEFAULT_RY2 = 0.7027, 0.9052
+        # Current Windows mini-program layout. The title bar makes the vertical
+        # ratios different from the original macOS capture.
+        if os.name == 'nt':
+            DEFAULT_RX1, DEFAULT_RY1 = 0.3020, 0.1640
+            DEFAULT_RX2, DEFAULT_RY2 = 0.6980, 0.8960
+        else:
+            DEFAULT_RX1, DEFAULT_RY1 = 0.2985, 0.1344
+            DEFAULT_RX2, DEFAULT_RY2 = 0.7027, 0.9052
 
         def try_grid(rx1, ry1, rx2, ry2):
             """Try a grid configuration, return (total_confidence, non_empty_count)."""
@@ -152,24 +227,27 @@ class Bot:
                     self.win_x, self.win_y, cw, ch)
             finally:
                 sys.stdout = old_stdout
-            # Score: sum of max confidence for non-empty cells
-            total_conf = 0.0
-            n_pieces = 0
-            for r in range(10):
-                for c in range(9):
-                    if self.cnn._cell_probs[r][c] is not None:
-                        conf = float(self.cnn._cell_probs[r][c].max())
-                        if board[r][c] is not None:
-                            total_conf += conf
-                            n_pieces += 1
-            return total_conf, n_pieces
+            confidences = [
+                float(self.cnn._cell_probs[r][c].max())
+                for r in range(10) for c in range(9)
+                if self.cnn._cell_probs[r][c] is not None
+            ]
+            n_pieces = sum(cell is not None for row in board for cell in row)
+            has_kings = any('K' in row for row in board) and any('k' in row for row in board)
+            avg_conf = float(np.mean(confidences)) if confidences else 0.0
+            # Reject grids that invent pieces or lose either king. Among legal
+            # candidates, prefer whole-board confidence instead of rewarding
+            # extra non-empty predictions.
+            legal_piece_count = 2 <= n_pieces <= 32
+            score = avg_conf + (2.0 if has_kings else 0.0) + (1.0 if legal_piece_count else -3.0)
+            return score, n_pieces
 
         # First try default ratios
         best_score, best_n = try_grid(DEFAULT_RX1, DEFAULT_RY1, DEFAULT_RX2, DEFAULT_RY2)
         best_params = (DEFAULT_RX1, DEFAULT_RY1, DEFAULT_RX2, DEFAULT_RY2)
 
         # Fine-tune: grid search around default with small offsets
-        STEP = 0.005  # ~0.5% of window size
+        STEP = 0.004  # ~0.4% of window size
         for dx in [-STEP, 0, STEP]:
             for dy in [-STEP, 0, STEP]:
                 for ds in [-STEP, 0, STEP]:  # scale adjustment
@@ -186,6 +264,7 @@ class Bot:
                         best_params = (rx1, ry1, rx2, ry2)
 
         rx1, ry1, rx2, ry2 = best_params
+        self.calib_ratios = (rx1, ry1, rx2, ry2)
         x1 = self.win_x + rx1 * win_w
         y1 = self.win_y + ry1 * win_h
         x2 = self.win_x + rx2 * win_w
@@ -196,71 +275,83 @@ class Bot:
         self.cols_logical = [x1 + i * self.cell_w for i in range(9)]
         self.rows_logical = [y1 + j * self.cell_h for j in range(10)]
 
-        print(f"  Auto-calibrate (CNN): {best_n} pieces, conf={best_score:.1f}, cell={self.cell_w:.1f}x{self.cell_h:.1f}")
+        print(f"  Auto-calibrate (CNN): {best_n} pieces, score={best_score:.2f}, cell={self.cell_w:.1f}x{self.cell_h:.1f}")
 
-        # Save calibration
-        with open(CALIB_PATH, 'w') as f:
-            json.dump({'rx1': rx1, 'ry1': ry1, 'rx2': rx2, 'ry2': ry2}, f)
-
-        if best_n < 10:
-            print("  Auto-calibrate: too few pieces detected, may be inaccurate")
+        if best_n < 2 or best_n > 32:
+            print("  Auto-calibrate: invalid piece count")
             return False
+
+        # Save only a grid that passed the basic recognition check.
+        with open(CALIB_PATH, 'w') as f:
+            json.dump({
+                'version': CALIB_VERSION,
+                'platform': os.name,
+                'rx1': rx1, 'ry1': ry1, 'rx2': rx2, 'ry2': ry2,
+            }, f)
         return True
 
     def calibrate(self):
-        """Calibration: user points mouse to 2 corner pieces (countdown, no Enter needed)."""
+        """Calibration: user confirms the two corner grid intersections."""
         print("\n=== CALIBRATION ===")
-        print("Move mouse to TOP-LEFT corner piece (leftmost piece on top rank)")
-        for i in range(5, 0, -1):
-            print(f"  Capturing in {i}...", end="\r")
-            time.sleep(1)
+        input("Move mouse to the TOP-LEFT grid intersection, then press ENTER (do not click)...")
         x1, y1 = pyautogui.position()
         print(f"  Top-left: ({x1}, {y1})        ")
 
-        print("\nNow move mouse to BOTTOM-RIGHT corner piece (rightmost piece on bottom rank)")
-        for i in range(5, 0, -1):
-            print(f"  Capturing in {i}...", end="\r")
-            time.sleep(1)
+        input("Move mouse to the BOTTOM-RIGHT grid intersection, then press ENTER (do not click)...")
         x2, y2 = pyautogui.position()
         print(f"  Bottom-right: ({x2}, {y2})        ")
 
-        self.cell_w = (x2 - x1) / 8.0
-        self.cell_h = (y2 - y1) / 9.0
+        win_w = self._get_window_width()
+        win_h = self._get_window_height()
+        inside_window = (
+            self.win_x <= x1 <= self.win_x + win_w and
+            self.win_x <= x2 <= self.win_x + win_w and
+            self.win_y <= y1 <= self.win_y + win_h and
+            self.win_y <= y2 <= self.win_y + win_h)
+        cell_w = (x2 - x1) / 8.0
+        cell_h = (y2 - y1) / 9.0
+        if (not inside_window or x1 >= x2 or y1 >= y2 or
+                cell_w < 20 or cell_h < 20):
+            print("\n  ERROR: invalid calibration points; nothing was saved.")
+            print("  Move the entire game window onto the screen, then run")
+            print("  重新校准并启动.bat again and confirm the two corner grid intersections.")
+            return False
+
+        self.cell_w = cell_w
+        self.cell_h = cell_h
 
         self.cols_logical = [x1 + i * self.cell_w for i in range(9)]
         self.rows_logical = [y1 + j * self.cell_h for j in range(10)]
+        self.calib_ratios = (
+            (x1 - self.win_x) / win_w,
+            (y1 - self.win_y) / win_h,
+            (x2 - self.win_x) / win_w,
+            (y2 - self.win_y) / win_h)
 
         print(f"\n  Cell size: {self.cell_w:.1f} x {self.cell_h:.1f} logical pixels")
         print(f"  Grid: x=[{x1:.0f}..{x2:.0f}] y=[{y1:.0f}..{y2:.0f}]")
 
         # Save calibration as relative to window (survives resize)
         import json
-        win_w = self._get_window_width()
-        win_h = self._get_window_height()
         with open(CALIB_PATH, 'w') as f:
             json.dump({
-                'rx1': (x1 - self.win_x) / win_w,
-                'ry1': (y1 - self.win_y) / win_h,
-                'rx2': (x2 - self.win_x) / win_w,
-                'ry2': (y2 - self.win_y) / win_h,
+                'version': CALIB_VERSION,
+                'platform': os.name,
+                'rx1': self.calib_ratios[0],
+                'ry1': self.calib_ratios[1],
+                'rx2': self.calib_ratios[2],
+                'ry2': self.calib_ratios[3],
             }, f)
         print(f"  Saved to {CALIB_PATH}")
+        return True
 
     def _get_window_width(self):
-        windows = Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-        for w in windows:
-            if w.get('kCGWindowNumber') == self.win_id:
-                return int(w['kCGWindowBounds']['Width'])
-        return 1628  # fallback
+        self.platform._refresh_windows()
+        return self.platform.width
 
     def _get_window_height(self):
-        windows = Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
-        for w in windows:
-            if w.get('kCGWindowNumber') == self.win_id:
-                return int(w['kCGWindowBounds']['Height'])
-        return 960  # fallback
+        self.platform._refresh_windows()
+        return self.platform.height
 
     def load_calibration(self):
         """Load calibration, auto-adapt to current window size/position."""
@@ -271,10 +362,25 @@ class Bot:
             with open(CALIB_PATH) as f:
                 d = json.load(f)
 
+            # Legacy calibration shipped by the original macOS project. It was
+            # measured on the author's window and must not be reused on Windows.
+            if os.name == 'nt' and (
+                    d.get('version') != CALIB_VERSION or
+                    d.get('platform') != 'nt'):
+                print("  Ignoring legacy calibration; recalibrating for this Windows window")
+                return False
+
+            if 'rx1' in d and not (
+                    0 <= d['rx1'] < d['rx2'] <= 1 and
+                    0 <= d['ry1'] < d['ry2'] <= 1):
+                print("  Ignoring invalid calibration coordinates")
+                return False
+
             # Support both relative (new) and absolute (old) formats
             if 'rx1' in d:
                 win_w = self._get_window_width()
                 win_h = self._get_window_height()
+                self.calib_ratios = (d['rx1'], d['ry1'], d['rx2'], d['ry2'])
                 x1 = self.win_x + d['rx1'] * win_w
                 y1 = self.win_y + d['ry1'] * win_h
                 x2 = self.win_x + d['rx2'] * win_w
@@ -285,6 +391,13 @@ class Bot:
                     dx = self.win_x - d.get('win_x', 0)
                     dy = self.win_y - d.get('win_y', 0)
                     x1 += dx; y1 += dy; x2 += dx; y2 += dy
+                win_w = self._get_window_width()
+                win_h = self._get_window_height()
+                self.calib_ratios = (
+                    (x1 - self.win_x) / win_w,
+                    (y1 - self.win_y) / win_h,
+                    (x2 - self.win_x) / win_w,
+                    (y2 - self.win_y) / win_h)
 
             self.cell_w = (x2 - x1) / 8.0
             self.cell_h = (y2 - y1) / 9.0
@@ -294,6 +407,32 @@ class Bot:
             return True
         except:
             return False
+
+    def validate_calibration(self, img):
+        """Reject a loaded grid when CNN evidence says it is visibly misaligned."""
+        if not self.load_cnn():
+            return True
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            board = self.cnn.parse_board(
+                img, self.cols_logical, self.rows_logical,
+                self.retina_scale, self.win_x, self.win_y,
+                self.cell_w, self.cell_h)
+        finally:
+            sys.stdout = old_stdout
+        piece_count = sum(cell is not None for row in board for cell in row)
+        confidences = [
+            float(self.cnn._cell_probs[r][c].max())
+            for r in range(10) for c in range(9)
+            if self.cnn._cell_probs[r][c] is not None
+        ]
+        avg_conf = float(np.mean(confidences)) if confidences else 0.0
+        valid = 10 <= piece_count <= 32 and avg_conf >= 0.70
+        if not valid:
+            print(f"  Loaded grid failed validation: pieces={piece_count}, confidence={avg_conf:.0%}")
+        return valid
 
     # --- Orientation & Templates ---
 
@@ -313,6 +452,40 @@ class Bot:
             red_total += (cv2.countNonZero(m1) + cv2.countNonZero(m2)) / max(1, patch.size//3)
         self.playing_red = red_total < 0.03
         print(f"  You play: {'RED' if self.playing_red else 'BLACK'}")
+
+    def determine_orientation(self, board):
+        """Require king placement and whole-board piece cases to agree."""
+        red_kings = [(r, c) for r in range(10) for c in range(9)
+                     if board[r][c] == 'K']
+        black_kings = [(r, c) for r in range(10) for c in range(9)
+                       if board[r][c] == 'k']
+        votes = []
+        if len(red_kings) == 1 and len(black_kings) == 1:
+            if red_kings[0][0] == black_kings[0][0]:
+                return None, "the two kings were detected on the same rank"
+            votes.append(("king positions", red_kings[0][0] > black_kings[0][0]))
+
+        red_bottom = sum(1 for r in range(5, 10) for p in board[r]
+                         if p and p.isupper())
+        red_top = sum(1 for r in range(5) for p in board[r]
+                      if p and p.isupper())
+        black_top = sum(1 for r in range(5) for p in board[r]
+                        if p and p.islower())
+        black_bottom = sum(1 for r in range(5, 10) for p in board[r]
+                           if p and p.islower())
+        normal = red_bottom + black_top
+        reversed_view = red_top + black_bottom
+        if abs(normal - reversed_view) >= 2:
+            votes.append(("piece distribution", normal > reversed_view))
+
+        if not votes:
+            return None, "not enough reliable red/black evidence"
+        if any(value != votes[0][1] for _, value in votes[1:]):
+            details = ", ".join(f"{name}={'RED' if value else 'BLACK'}"
+                                for name, value in votes)
+            return None, f"orientation signals conflict ({details})"
+        details = ", ".join(name for name, _ in votes)
+        return votes[0][1], details
 
     def capture_templates(self, img):
         """Capture templates from ALL initial positions (multiple per piece)."""
@@ -1144,24 +1317,20 @@ class Bot:
 
     def get_legal_moves(self, fen):
         """Get all legal moves from pikafish for the given position."""
-        proc = subprocess.Popen(
-            [PIKAFISH], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, cwd=PIKAFISH_DIR)
-        proc.stdin.write(f"uci\nisready\nposition fen {fen}\ngo perft 1\n")
-        proc.stdin.flush()
+        try:
+            result = subprocess.run(
+                [PIKAFISH],
+                input=f"uci\nisready\nposition fen {fen}\ngo perft 1\nquit\n",
+                text=True, capture_output=True, cwd=PIKAFISH_DIR, timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            print("  Legal-move query failed or timed out")
+            return []
         moves = []
-        t0 = time.time()
-        while time.time() - t0 < 5:
-            line = proc.stdout.readline().strip()
-            if not line: continue
-            if ':' in line and len(line.split(':')[0].strip()) == 4:
-                moves.append(line.split(':')[0].strip())
-            if line.startswith('Nodes'):
-                break
-        try: proc.stdin.write("quit\n"); proc.stdin.flush()
-        except: pass
-        try: proc.wait(timeout=2)
-        except: proc.kill()
+        for raw in result.stdout.splitlines():
+            line = raw.strip()
+            head = line.split(':', 1)[0].strip()
+            if ':' in line and len(head) == 4:
+                moves.append(head)
         return moves
 
     def _find_move(self, old_fen, new_fen):
@@ -1220,6 +1389,178 @@ class Bot:
         else:
             return (fr, 8-fc), (tr, 8-tc)
 
+    def _apply_board_move(self, board, move):
+        """Apply one UCI move to a screen-oriented board copy."""
+        src, dst = self.uci_to_screen_cells(move)
+        piece = board[src[0]][src[1]]
+        if piece is None:
+            return None
+        result = [row[:] for row in board]
+        result[src[0]][src[1]] = None
+        result[dst[0]][dst[1]] = piece
+        return result
+
+    def _search_time_for_board(self, board):
+        """Spend more time where sparse positions require deeper calculation."""
+        piece_count = sum(cell is not None for row in board for cell in row)
+        if piece_count <= 12:
+            return ENDGAME_MOVE_TIME_MS
+        if piece_count <= 20:
+            return LATE_MIDDLEGAME_MOVE_TIME_MS
+        return MOVE_TIME_MS
+
+    def _match_unique_legal_transition(self, board_before, parsed_board,
+                                       legal_moves):
+        """Accept a visual board only if exactly one legal move produces it."""
+        if not parsed_board:
+            return None, None
+        target = self.board_to_fen(parsed_board)
+        matches = []
+        for move in legal_moves:
+            result = self._apply_board_move(board_before, move)
+            if result is not None and self.board_to_fen(result) == target:
+                matches.append((move, result))
+        return matches[0] if len(matches) == 1 else (None, None)
+
+    def _select_transition_consensus(self, observations, required=2):
+        """Return a transition only after repeated independent agreement."""
+        votes = {}
+        for move, board in observations:
+            if not move or board is None:
+                continue
+            key = (move, self.board_to_fen(board))
+            votes[key] = votes.get(key, 0) + 1
+        winners = [(count, key) for key, count in votes.items()
+                   if count >= required]
+        if len(winners) != 1:
+            return None, None
+        _, (move, _fen) = winners[0]
+        for observed_move, board in observations:
+            if (observed_move == move and board is not None and
+                    self.board_to_fen(board) == _fen):
+                return move, board
+        return None, None
+
+    def _select_transition_consensus_with_confidence(self, observations,
+                                                     required=2):
+        """Select repeated move/FEN agreement and assign A/B confidence."""
+        grouped = {}
+        for move, board, grade in observations:
+            if not move or board is None or grade not in ('A', 'B'):
+                continue
+            key = (move, self.board_to_fen(board))
+            grouped.setdefault(key, []).append((board, grade))
+        winners = [(key, entries) for key, entries in grouped.items()
+                   if len(entries) >= required]
+        if len(winners) != 1:
+            return None, None, None
+        (move, _fen), entries = winners[0]
+        strict_votes = sum(grade == 'A' for _, grade in entries)
+        confidence = 'A' if strict_votes >= required else 'B'
+        return move, entries[0][0], confidence
+
+    def _state_is_safe_for_engine(self, board, confidence):
+        """Final gate before engine search."""
+        valid, reason = self.board_is_plausible(board)
+        if not valid:
+            return False, reason
+        if confidence not in ('A', 'B'):
+            return False, f"untrusted confidence {confidence!r}"
+        return True, ""
+
+    def _match_legal_transition_with_endpoint_changes(
+            self, board_before, parsed_board, legal_moves,
+            img_before, img_after):
+        """Recover one opponent move despite CNN noise on unrelated cells."""
+        move, result = self._match_unique_legal_transition(
+            board_before, parsed_board, legal_moves)
+        if move:
+            return move, result
+        if not parsed_board or img_before is None or img_after is None:
+            return None, None
+
+        candidates = []
+        for legal_move in legal_moves:
+            expected = self._apply_board_move(board_before, legal_move)
+            if expected is None:
+                continue
+            src, dst = self.uci_to_screen_cells(legal_move)
+            # Unrelated CNN mistakes are tolerated, but both endpoints must
+            # describe the final position of this particular legal move.
+            if (parsed_board[src[0]][src[1]] is not None or
+                    parsed_board[dst[0]][dst[1]] != expected[dst[0]][dst[1]]):
+                continue
+            endpoint_cells = {src, dst}
+            unrelated_mismatches = sum(
+                parsed_board[r][c] != expected[r][c]
+                for r in range(10) for c in range(9)
+                if (r, c) not in endpoint_cells)
+            # A few isolated CNN errors are expected. More than four means the
+            # observed board is too unreliable to update the engine position.
+            if unrelated_mismatches > 4:
+                continue
+            source_delta = self._piece_cell_change(
+                img_before, img_after, src[0], src[1])
+            destination_delta = self._piece_cell_change(
+                img_before, img_after, dst[0], dst[1])
+            if source_delta > 8.0 and destination_delta > 8.0:
+                candidates.append(
+                    (source_delta + destination_delta, legal_move, expected))
+
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        if not candidates:
+            return None, None
+        if len(candidates) > 1:
+            best, second = candidates[0][0], candidates[1][0]
+            if best < second * 1.20 or best - second < 5.0:
+                return None, None
+        _, move, result = candidates[0]
+        return move, result
+
+    def _move_board_matches(self, parsed_board, expected_board, move,
+                            source_changed=False, destination_changed=False):
+        """Confirm our legal move without trusting unrelated noisy cells.
+
+        An exact board match is preferred.  When CNN recognition is noisy away
+        from the move, accept only if both move endpoints changed visually and
+        the recognised source/destination have the expected final contents.
+        """
+        if not parsed_board or not expected_board:
+            return False
+        if self.board_to_fen(parsed_board) == self.board_to_fen(expected_board):
+            return True
+        src, dst = self.uci_to_screen_cells(move)
+        return (source_changed and destination_changed and
+                parsed_board[src[0]][src[1]] is None and
+                parsed_board[dst[0]][dst[1]] == expected_board[dst[0]][dst[1]])
+
+    def _move_visually_confirmed(self, before_img, previous_img, current_img,
+                                 move):
+        """Last-resort confirmation when CNN also misclassifies an endpoint."""
+        if before_img is None or previous_img is None or current_img is None:
+            return False
+        if self._is_my_turn_image(current_img):
+            return False
+        if not self._is_opponent_turn_image(current_img):
+            return False
+        src, dst = self.uci_to_screen_cells(move)
+        # Both endpoints must have changed substantially from before the click,
+        # then remain stable across two consecutive observations.
+        changed = (
+            self._piece_cell_change(before_img, current_img, *src) > 8.0 and
+            self._piece_cell_change(before_img, current_img, *dst) > 8.0)
+        stable = (
+            self._piece_cell_change(previous_img, current_img, *src) < 3.0 and
+            self._piece_cell_change(previous_img, current_img, *dst) < 3.0)
+        return changed and stable
+
+    def _deselect_board(self):
+        """Click between ranks in the river so no piece remains selected."""
+        river_x = self.cols_logical[4]
+        river_y = (self.rows_logical[4] + self.rows_logical[5]) / 2
+        self.click(river_x, river_y)
+        time.sleep(0.15)
+
     def _cell_change(self, img_before, img_after, r, c):
         """Compute pixel change at a specific cell (centered, no overlap)."""
         px, py = self.logical_to_pixel(self.cols_logical[c], self.rows_logical[r])
@@ -1234,6 +1575,33 @@ class Bot:
         if p1.shape != p2.shape or p1.size == 0:
             return 0
         return cv2.absdiff(p1, p2).mean()
+
+    def _piece_cell_change(self, img_before, img_after, r, c):
+        """Measure center-piece change while excluding move-highlight colors."""
+        px, py = self.logical_to_pixel(self.cols_logical[c], self.rows_logical[r])
+        hs = int(min(self.cell_w, self.cell_h) * self.retina_scale * 0.30)
+        h, w = img_before.shape[:2]
+        x1, y1 = max(0, px-hs), max(0, py-hs)
+        x2, y2 = min(w, px+hs), min(h, py+hs)
+        p1 = img_before[y1:y2, x1:x2]
+        p2 = img_after[y1:y2, x1:x2]
+        if p1.shape != p2.shape or p1.size == 0:
+            return 0.0
+
+        hsv1 = cv2.cvtColor(p1, cv2.COLOR_BGR2HSV)
+        hsv2 = cv2.cvtColor(p2, cv2.COLOR_BGR2HSV)
+        highlight = np.zeros(p1.shape[:2], dtype=np.uint8)
+        for hsv in (hsv1, hsv2):
+            green = cv2.inRange(hsv, (35, 50, 50), (90, 255, 255))
+            yellow = cv2.inRange(hsv, (20, 90, 100), (35, 255, 255))
+            highlight = cv2.bitwise_or(highlight, green)
+            highlight = cv2.bitwise_or(highlight, yellow)
+        valid = highlight == 0
+        if np.count_nonzero(valid) < valid.size * 0.40:
+            return 0.0
+        gray1 = cv2.cvtColor(p1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(p2, cv2.COLOR_BGR2GRAY)
+        return float(cv2.absdiff(gray1, gray2)[valid].mean())
 
     def detect_move_perft(self, img_before, img_after, board_before, fen_before):
         """Detect opponent's move: score each legal move by pixel change at src+dst."""
@@ -1251,8 +1619,8 @@ class Bot:
         scored = []
         for move in legal_moves:
             src, dst = self.uci_to_screen_cells(move)
-            sc = self._cell_change(img_before, img_after, src[0], src[1])
-            dc = self._cell_change(img_before, img_after, dst[0], dst[1])
+            sc = self._piece_cell_change(img_before, img_after, src[0], src[1])
+            dc = self._piece_cell_change(img_before, img_after, dst[0], dst[1])
             scored.append((move, src, dst, sc + dc))
 
         scored.sort(key=lambda x: -x[3])
@@ -1573,6 +1941,31 @@ class Bot:
             parts.append(s)
         return "/".join(parts)
 
+    def board_is_plausible(self, board):
+        """Safety gate before sending a visually parsed position to the engine."""
+        if not board or len(board) != 10 or any(len(row) != 9 for row in board):
+            return False, "board dimensions are invalid"
+        flat = [cell for row in board for cell in row if cell is not None]
+        if len(flat) < 2 or len(flat) > 32:
+            return False, f"piece count is {len(flat)}"
+        if flat.count('K') != 1 or flat.count('k') != 1:
+            return False, f"king count is K={flat.count('K')}, k={flat.count('k')}"
+        limits = {'K': 1, 'A': 2, 'B': 2, 'N': 2, 'R': 2, 'C': 2, 'P': 5,
+                  'k': 1, 'a': 2, 'b': 2, 'n': 2, 'r': 2, 'c': 2, 'p': 5}
+        for piece, limit in limits.items():
+            if flat.count(piece) > limit:
+                return False, f"too many {piece} pieces ({flat.count(piece)} > {limit})"
+        canonical = board if self.playing_red else [row[::-1] for row in reversed(board)]
+        red_king = next((r, c) for r in range(10) for c in range(9)
+                        if canonical[r][c] == 'K')
+        black_king = next((r, c) for r in range(10) for c in range(9)
+                          if canonical[r][c] == 'k')
+        if not (7 <= red_king[0] <= 9 and 3 <= red_king[1] <= 5):
+            return False, f"red king is outside its palace at {red_king}"
+        if not (0 <= black_king[0] <= 2 and 3 <= black_king[1] <= 5):
+            return False, f"black king is outside its palace at {black_king}"
+        return True, ""
+
     # --- Move Execution ---
 
     def uci_to_logical(self, move):
@@ -1756,49 +2149,122 @@ class Bot:
 
     def activate_window(self):
         """Bring WeChat to front and focus the specific mini-program window."""
-        subprocess.run(['osascript', '-e',
-            'tell application "WeChat" to activate'],
-            capture_output=True, timeout=2)
-        time.sleep(0.3)
-        # Click the title bar of the 天天象棋 window to ensure THIS window
-        # (not the main WeChat window) has keyboard/mouse focus.
-        # Window is at (win_x, win_y), size ~1628x960.
-        # Title bar is at y=win_y, roughly 25px tall. Click center.
-        title_x = self.win_x + 814
-        title_y = self.win_y + 5  # Just inside the title bar
-        self._cgevent_click(title_x, title_y)
-        time.sleep(0.2)
+        self.platform.activate()
 
     def click(self, lx, ly):
-        """Click using CGEvent (bypasses pyautogui, more reliable for WebViews)."""
-        self._cgevent_click(int(lx), int(ly))
+        """Click through the active platform adapter."""
+        self.platform.click(lx, ly)
 
     def _cgevent_click(self, x, y):
-        """Low-level click using Quartz CGEvent API."""
-        point = Quartz.CGPointMake(x, y)
-        # Move mouse to position first
-        move = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventMouseMoved, point, 0)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
-        time.sleep(0.08)
-        # Mouse down
-        down = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventLeftMouseDown, point,
-            Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
-        time.sleep(0.08)
-        # Mouse up
-        up = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventLeftMouseUp, point,
-            Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        """Compatibility alias retained for callers from older code."""
+        self.platform.click(x, y)
 
     # --- Pikafish ---
 
-    def pikafish(self, fen, move_history=None, excluded=None):
+    def _stop_pikafish(self, force=False):
+        proc = self._engine_proc
+        self._engine_proc = None
+        self._engine_lines = None
+        self._engine_reader = None
+        if proc is None:
+            return
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.stdin.write("quit\n")
+                proc.stdin.flush()
+                proc.wait(timeout=0.5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _start_pikafish(self):
+        self._stop_pikafish(force=True)
         proc = subprocess.Popen(
             [PIKAFISH], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, cwd=PIKAFISH_DIR)
+        lines = queue.Queue()
+
+        def read_output():
+            try:
+                for raw in iter(proc.stdout.readline, ''):
+                    lines.put(raw.rstrip())
+            finally:
+                lines.put(None)
+
+        self._engine_proc = proc
+        self._engine_lines = lines
+        self._engine_reader = threading.Thread(target=read_output, daemon=True)
+        self._engine_reader.start()
+        try:
+            proc.stdin.write("uci\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self._stop_pikafish(force=True)
+            return False
+
+        deadline = time.monotonic() + ENGINE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                line = lines.get(timeout=0.05)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if line is None:
+                break
+            if line == "uciok":
+                break
+        else:
+            line = None
+        if line != "uciok":
+            self._stop_pikafish(force=True)
+            return False
+
+        try:
+            proc.stdin.write(
+                f"setoption name Threads value {ENGINE_THREADS}\n"
+                f"setoption name Hash value {ENGINE_HASH_MB}\n"
+                f"setoption name MultiPV value {ENGINE_MULTIPV}\n"
+                "isready\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self._stop_pikafish(force=True)
+            return False
+
+        while time.monotonic() < deadline:
+            try:
+                line = lines.get(timeout=0.05)
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if line is None:
+                break
+            if line == "readyok":
+                return True
+        self._stop_pikafish(force=True)
+        return False
+
+    def _ensure_pikafish(self):
+        return (self._engine_proc is not None and
+                self._engine_proc.poll() is None) or self._start_pikafish()
+
+    def pikafish(self, fen, move_history=None, excluded=None,
+                 movetime_ms=None):
+        with self._engine_lock:
+            return self._pikafish_locked(
+                fen, move_history=move_history, excluded=excluded,
+                movetime_ms=movetime_ms)
+
+    def _pikafish_locked(self, fen, move_history=None, excluded=None,
+                         movetime_ms=None):
+        if not self._ensure_pikafish():
+            return None, ""
+        proc = self._engine_proc
         if move_history:
             pos_cmd = f"position fen {fen} moves {' '.join(move_history)}\n"
         else:
@@ -1807,38 +2273,87 @@ class Bot:
         if SEARCH_DEPTH > 0:
             go_cmd = f"go depth {SEARCH_DEPTH}"
         else:
-            go_cmd = f"go movetime {MOVE_TIME_MS}"
+            search_ms = MOVE_TIME_MS if movetime_ms is None else max(1, int(movetime_ms))
+            go_cmd = f"go movetime {search_ms}"
         if excluded:
             legal = self.get_legal_moves(fen)
             allowed = [m for m in legal if m not in excluded]
             if allowed:
                 go_cmd += f" searchmoves {' '.join(allowed)}"
         try:
-            proc.stdin.write(f"uci\nisready\n{pos_cmd}{go_cmd}\n")
+            proc.stdin.write(f"{pos_cmd}{go_cmd}\n")
             proc.stdin.flush()
-        except BrokenPipeError:
-            err = proc.stderr.read()
-            print(f"  Pikafish crash! stderr: {err[:200]}")
-            proc.kill()
+        except (BrokenPipeError, OSError):
+            self._stop_pikafish(force=True)
             return None, ""
         best, info = None, ""
-        t0 = time.time()
-        while time.time() - t0 < MOVE_TIME_MS/1000 + 5:
-            line = proc.stdout.readline().strip()
-            if not line:
+        engine_timeout_s = ENGINE_TIMEOUT_S
+        if SEARCH_DEPTH <= 0 and movetime_ms is not None:
+            engine_timeout_s = max(
+                ENGINE_TIMEOUT_S, search_ms / 1000.0 + 2.0)
+        deadline = time.monotonic() + engine_timeout_s
+        timed_out = False
+        while time.monotonic() < deadline:
+            try:
+                line = self._engine_lines.get(
+                    timeout=min(0.1, max(0.01, deadline - time.monotonic())))
+            except queue.Empty:
                 if proc.poll() is not None:
                     break
                 continue
+            if line is None:
+                break
             if line.startswith('bestmove'):
                 best = line.split()[1] if len(line.split()) > 1 else None
                 break
             if 'score' in line:
                 info = line
-        try: proc.stdin.write("quit\n"); proc.stdin.flush()
-        except: pass
-        try: proc.wait(timeout=2)
-        except: proc.kill()
+        else:
+            timed_out = True
+        if timed_out:
+            print(f"  Pikafish timed out after {engine_timeout_s:.1f}s; restarting engine")
+            self._stop_pikafish(force=True)
         return best, info
+
+    def wait_for_our_turn(self, timeout_s=TURN_WAIT_TIMEOUT_S):
+        """Poll at a controlled rate; return False when no turn signal arrives."""
+        deadline = time.monotonic() + timeout_s
+        dots = 0
+        while not self.stop_flag and time.monotonic() < deadline:
+            self.check_delay_hotkey()
+            if self.is_my_turn():
+                return True
+            time.sleep(TURN_POLL_INTERVAL_S)
+            dots += 1
+            if dots % 20 == 0:
+                sys.stdout.write(".")
+                sys.stdout.flush()
+        return False
+
+    def check_delay_hotkey(self):
+        """Toggle optional extra search time with the global F8 key."""
+        if os.name != "nt":
+            return False
+        try:
+            pressed_since_last_check = ctypes.windll.user32.GetAsyncKeyState(0x77) & 1
+        except (AttributeError, OSError):
+            return False
+        if not pressed_since_last_check:
+            return False
+        self.move_delay_enabled = not self.move_delay_enabled
+        state = "ON (add random 2-10s to search)" if self.move_delay_enabled else "OFF"
+        print(f"\n  [F8] Extra search time: {state}", flush=True)
+        return True
+
+    def _search_time_for_turn(self, board):
+        """Invest the optional human-like delay in engine search, not idling."""
+        self.check_delay_hotkey()
+        search_ms = self._search_time_for_board(board)
+        if not self.move_delay_enabled:
+            return search_ms
+        extra_s = random.uniform(MOVE_DELAY_MIN_S, MOVE_DELAY_MAX_S)
+        print(f"  Extra search time: {extra_s:.1f}s", flush=True)
+        return search_ms + int(round(extra_s * 1000))
 
     def score_str(self, info):
         if 'score cp' in info:
@@ -1875,22 +2390,44 @@ class Bot:
         # If more than 0.5% of pixels changed significantly, board changed
         return change_ratio > 0.005
 
+    def _wait_for_board_stable(self, max_wait_s=3.0, interval_s=0.25,
+                               required_stable=2):
+        """Wait for consecutive stable board frames, bounded and fail-closed."""
+        previous = self.screenshot_for_processing()
+        self._last_stability_image = previous
+        stable_count = 0
+        deadline = time.monotonic() + max_wait_s
+        while not self.stop_flag and time.monotonic() < deadline:
+            time.sleep(interval_s)
+            current = self.screenshot_for_processing()
+            self._last_stability_image = current
+            previous_crop = self.crop_board_region(previous)
+            current_crop = self.crop_board_region(current)
+            if self.images_changed(previous_crop, current_crop):
+                stable_count = 0
+            else:
+                stable_count += 1
+                if stable_count >= required_stable:
+                    return current
+            previous = current
+        return None
+
     def crop_avatar_region(self, img):
-        """Crop our avatar region (bottom-right)."""
+        """Crop our avatar frame (bottom-right), excluding the clock below it."""
         h, w = img.shape[:2]
-        x1 = int(w * 0.76)
-        y1 = int(h * 0.68)
-        x2 = int(w * 0.88)
-        y2 = int(h * 0.84)
+        x1 = int(w * 0.775)
+        y1 = int(h * 0.705)
+        x2 = int(w * 0.838)
+        y2 = int(h * 0.810)
         return img[y1:y2, x1:x2].copy()
 
     def crop_opponent_avatar_region(self, img):
-        """Crop opponent avatar region (left side, upper area)."""
+        """Crop opponent avatar frame (upper-left), excluding the clock below it."""
         h, w = img.shape[:2]
-        x1 = int(w * 0.12)
-        y1 = int(h * 0.15)
-        x2 = int(w * 0.22)
-        y2 = int(h * 0.38)
+        x1 = int(w * 0.163)
+        y1 = int(h * 0.165)
+        x2 = int(w * 0.228)
+        y2 = int(h * 0.272)
         return img[y1:y2, x1:x2].copy()
 
     def _check_green_border(self, avatar):
@@ -1910,9 +2447,22 @@ class Bot:
     def is_my_turn(self):
         """Check if it's our turn by detecting green in our avatar border."""
         img = self.screenshot_for_processing()
+        return self._is_my_turn_image(img)
+
+    def _is_my_turn_image(self, img):
         return self._check_green_border(self.crop_avatar_region(img)) > 0.005
 
+    def _is_opponent_turn_image(self, img):
+        return self._check_green_border(
+            self.crop_opponent_avatar_region(img)) > 0.005
+
     def run(self):
+        try:
+            self._run()
+        finally:
+            self._stop_pikafish()
+
+    def _run(self):
         print("=== Xiangqi Bot (Pikafish) ===\n")
         if not os.path.exists(PIKAFISH):
             print(f"ERROR: {PIKAFISH} not found"); sys.exit(1)
@@ -1925,11 +2475,29 @@ class Bot:
         print(f"  Image: {img.shape[1]}x{img.shape[0]}, retina={self.retina_scale:.2f}x")
 
         print("[3] Calibration...")
-        if not self.load_calibration():
-            if not self.auto_calibrate(img):
+        force_manual = os.environ.get('XIANGQI_MANUAL_CALIBRATION') == '1'
+        force_recalibrate = os.environ.get('XIANGQI_RECALIBRATE') == '1'
+        loaded_calibration = (False if force_manual or force_recalibrate
+                              else self.load_calibration())
+        if loaded_calibration and not self.validate_calibration(img):
+            loaded_calibration = False
+        if not loaded_calibration:
+            if force_manual:
+                print("  Manual calibration requested")
+                if not self.calibrate():
+                    return
+                img = self.screenshot_for_processing()
+                if not self.validate_calibration(img):
+                    print("  ERROR: manual calibration did not match a visible board; stopping.")
+                    return
+            elif not self.auto_calibrate(img):
                 print("  Auto-calibrate failed, falling back to manual...")
-                self.calibrate()
+                if not self.calibrate():
+                    return
                 img = self.screenshot_for_processing()  # retake after manual calibration
+                if not self.validate_calibration(img):
+                    print("  ERROR: manual calibration did not match a visible board; stopping.")
+                    return
 
         print("[4] Waiting for board to stabilize...")
         # Keep re-parsing until two consecutive reads give the same FEN
@@ -1971,18 +2539,13 @@ class Bot:
 
         if self.cnn:
             board = self.parse_board_cnn(img)
-            # Detect orientation from king positions (works for any board state)
-            k_row = None
-            for r in range(10):
-                for c in range(9):
-                    if board[r][c] == 'K':
-                        k_row = r
-            if k_row is not None and k_row <= 4:
-                self.playing_red = False
-                print(f"  You play: BLACK (red K at row {k_row})")
-            else:
-                self.playing_red = True
-                print(f"  You play: RED (red K at row {k_row})")
+            orientation, evidence = self.determine_orientation(board)
+            if orientation is None:
+                print(f"  ERROR: cannot safely determine our side: {evidence}")
+                return
+            self.playing_red = orientation
+            print(f"  You play: {'RED' if self.playing_red else 'BLACK'} "
+                  f"({evidence})")
         else:
             self.detect_orientation(img)
             self.capture_templates(img)
@@ -1990,6 +2553,11 @@ class Bot:
             print("  Board parsed by template matching (no CNN)")
 
         fen = self.board_to_fen(board)
+        plausible, reason = self.board_is_plausible(board)
+        if not plausible:
+            print(f"\nERROR: board recognition is invalid ({reason}).")
+            print("Run 重新校准并启动.bat again with the complete board visible.")
+            return
         print(f"\n  FEN: {fen}")
 
         # Print board
@@ -2006,36 +2574,58 @@ class Bot:
         n = 0
         last_fen = fen
         last_board = [row[:] for row in board]  # deep copy for diff
+        state_confidence = 'A'
         self._cnn_session = int(time.time())
 
-        fen_history = {}  # fen -> last_move, to avoid repetition
-        excluded_moves = []  # moves to exclude if position repeats
-
         print(f"\n--- Game loop (playing {'RED' if self.playing_red else 'BLACK'}) ---\n")
+        print("  Press F8 to add a random 2-10s to engine search.\n")
 
         # Wait until it's our turn before starting (handles mid-game start too)
         if not self.is_my_turn():
             print("  Waiting for our turn...", end="", flush=True)
-            for wi in range(300):  # Up to ~150s
-                if self.stop_flag:
-                    print(" stopped")
-                    return
-                if self.is_my_turn():
-                    break
-                if wi % 10 == 0 and wi > 0:
-                    sys.stdout.write(".")
-                    sys.stdout.flush()
+            if not self.wait_for_our_turn():
+                print(" timed out; no turn indicator detected")
+                return
+            self._deselect_board()
+            stable_img = self._wait_for_board_stable()
+            if stable_img is None:
+                self._save_failure_diagnostics(
+                    "initial_board_never_stabilized",
+                    {"latest_observation": self._last_stability_image},
+                    {"tracked_fen": fen})
+                print(" ERROR: board animation did not stabilize; stopping.")
+                return
             print(" done")
-            # Re-parse board after opponent moved
-            time.sleep(1.5)
-            river_x = self.cols_logical[4]
-            river_y = (self.rows_logical[4] + self.rows_logical[5]) / 2
-            self.click(river_x, river_y)
-            time.sleep(0.5)
-            img = self.screenshot_for_processing()
-            board = self.parse_board_cnn(img) if self.cnn else self.parse_board(img)
+            opponent_side = 'b' if self.playing_red else 'w'
+            legal_moves = self.get_legal_moves(
+                f"{fen} {opponent_side} - - 0 1")
+            observations = []
+            for observation_index in range(3):
+                img = (stable_img if observation_index == 0
+                       else self.screenshot_for_processing())
+                parsed = self.parse_board_cnn(img) if self.cnn else self.parse_board(img)
+                observed_move, matched = self._match_unique_legal_transition(
+                    last_board, parsed, legal_moves)
+                observations.append((observed_move, matched, 'A'))
+                time.sleep(0.25)
+            opponent_move, matched, state_confidence = \
+                self._select_transition_consensus_with_confidence(
+                observations)
+            if not opponent_move:
+                self._save_failure_diagnostics(
+                    "initial_opponent_consensus_failed",
+                    {"latest_observation": img},
+                    {"tracked_fen": fen,
+                     "observations": [
+                         (move, self.board_to_fen(state) if state else None)
+                         for move, state, _grade in observations]})
+                print("  ERROR: opponent move lacked multi-frame legal consensus; stopping.")
+                return
+            board = matched
             fen = self.board_to_fen(board)
             last_board = [row[:] for row in board]
+            print(f"  Verified opponent move: {opponent_move} "
+                  f"[confidence {state_confidence}]")
             print(f"  Board → {fen}")
         else:
             print("  It's our turn, starting immediately")
@@ -2043,112 +2633,173 @@ class Bot:
         while not self.stop_flag:
             try:
                 # Step 1: Ask pikafish for best move
+                state_valid, state_reason = self._state_is_safe_for_engine(
+                    board, state_confidence)
+                if not state_valid:
+                    self._save_failure_diagnostics(
+                        "tracked_position_unsafe", metadata={
+                            "reason": state_reason,
+                            "tracked_fen": fen,
+                        })
+                    print(f"  ERROR: tracked position is unsafe ({state_reason}); "
+                          "not sending it to Pikafish.")
+                    return
                 full_fen = f"{fen} {turn} - - 0 1"
 
-                # Check for repetition
-                if fen in fen_history:
-                    excluded_moves.append(fen_history[fen])
-                    excl_str = ' '.join(set(excluded_moves))
-                    print(f"  Repeat! Excluding: {excl_str}")
-
                 print(f"  FEN → Pikafish: {full_fen}")
-                best, info = self.pikafish(full_fen, excluded=excluded_moves)
+                search_time_ms = self._search_time_for_turn(board)
+                if search_time_ms != MOVE_TIME_MS:
+                    print(f"  Engine search budget: {search_time_ms / 1000:.1f}s")
+                best, info = self.pikafish(
+                    full_fen, movetime_ms=search_time_ms)
 
                 if not best or best == '(none)':
-                    # Try without exclusions
-                    if excluded_moves:
-                        print("  No move with exclusions, trying without...")
-                        excluded_moves = []
-                        best, info = self.pikafish(full_fen)
+                    print("  No legal engine move; stopping without clicking.")
+                    return
 
-                if not best or best == '(none)':
-                    print(f"  No move! Re-parsing...")
-                    time.sleep(2)
-                    img = self.screenshot_for_processing()
-                    board = self.parse_board_cnn(img) if self.cnn else self.parse_board(img)
-                    fen = self.board_to_fen(board)
-                    continue
-
-                fen_history[fen] = best  # Track this move for this position
                 n += 1
                 sc = self.score_str(info)
                 print(f"[{n}] {best} ({sc})")
 
-                # Apply our move to last_board so Δ only shows opponent's changes
-                fc, fr = ord(best[0]) - ord('a'), int(best[1])
-                tc, tr = ord(best[2]) - ord('a'), int(best[3])
-                if self.playing_red:
-                    b_fr, b_fc = 9 - fr, fc
-                    b_tr, b_tc = 9 - tr, tc
-                else:
-                    b_fr, b_fc = fr, 8 - fc
-                    b_tr, b_tc = tr, 8 - tc
-                last_board[b_tr][b_tc] = last_board[b_fr][b_fc]
-                last_board[b_fr][b_fc] = None
+                expected_board = self._apply_board_move(board, best)
+                if expected_board is None:
+                    print(f"  ERROR: engine move {best} starts from an empty tracked cell.")
+                    return
+                if self.observer_mode:
+                    print(f"  Observer mode: suggested move {best}; no click was made.")
+                    return
 
-                # Step 2: Click our move (with retry)
-                pts = self.uci_to_logical(best)
-                before_crop = self.crop_board_region(self.screenshot_for_processing())
+                if self.stop_flag:
+                    return
 
+                # Step 2: execute one move transactionally. Selection highlights
+                # never count as success; the exact expected board and turn switch do.
                 click_ok = False
-                for click_try in range(3):
+                for click_try in range(2):
                     self.activate_window()
-                    time.sleep(0.3)
+                    self._deselect_board()
+                    before_move_img = self.screenshot_for_processing()
+                    pts = self.uci_to_logical(best)
                     self.click(pts[0][0], pts[0][1])
-                    time.sleep(0.8)
+                    time.sleep(0.25)
                     self.click(pts[1][0], pts[1][1])
-                    time.sleep(1.0)
-                    check = self.crop_board_region(self.screenshot_for_processing())
-                    if self.images_changed(before_crop, check):
-                        click_ok = True
+                    # Animations and the network response can outlive the old
+                    # fixed 0.45s delay. Poll briefly for a settled, confirmed
+                    # result instead of treating the first frame as failure.
+                    src_cell, dst_cell = self.uci_to_screen_cells(best)
+                    confirm_deadline = time.monotonic() + 2.0
+                    visual_candidate_img = None
+                    while time.monotonic() < confirm_deadline:
+                        time.sleep(0.25)
+                        after_img = self.screenshot_for_processing()
+                        parsed_after = (self.parse_board_cnn(after_img)
+                                        if self.cnn else self.parse_board(after_img))
+                        source_changed = self._piece_cell_change(
+                            before_move_img, after_img, *src_cell) > 3.0
+                        destination_changed = self._piece_cell_change(
+                            before_move_img, after_img, *dst_cell) > 3.0
+                        board_matches = self._move_board_matches(
+                            parsed_after, expected_board, best,
+                            source_changed, destination_changed)
+                        turn_switched = not self._is_my_turn_image(after_img)
+                        if board_matches and turn_switched:
+                            click_ok = True
+                            opponent_before_img = after_img.copy()
+                            break
+                        endpoint_changed = (
+                            source_changed and destination_changed)
+                        dual_turn_switched = (
+                            turn_switched and
+                            self._is_opponent_turn_image(after_img))
+                        if endpoint_changed and dual_turn_switched:
+                            if self._move_visually_confirmed(
+                                    before_move_img, visual_candidate_img,
+                                    after_img, best):
+                                print("  Move confirmed by stable endpoints and turn switch.")
+                                click_ok = True
+                                opponent_before_img = after_img.copy()
+                                break
+                            visual_candidate_img = after_img.copy()
+                        else:
+                            visual_candidate_img = None
+                    if click_ok:
                         break
-                    if click_try < 2:
-                        print(f"  Click retry {click_try+1}...")
+                    if click_try == 0:
+                        print("  Move was not fully confirmed; deselecting and retrying once...")
 
                 if not click_ok:
-                    # Click failed — wait for board change, then re-parse
-                    print("  Click failed — waiting for board change...")
-                    ref = self.crop_board_region(self.screenshot_for_processing())
-                    for wi in range(60):
-                        if self.stop_flag:
-                            return
-                        time.sleep(0.5)
-                        curr = self.screenshot_for_processing()
-                        if self.images_changed(ref, self.crop_board_region(curr)):
-                            time.sleep(1.5)
-                            break
-                        if wi % 20 == 0 and wi > 0:
-                            sys.stdout.write(".")
-                            sys.stdout.flush()
-                    # Re-parse entire board with CNN
-                    img = self.screenshot_for_processing()
-                    board = self.parse_board_cnn(img) if self.cnn else self.parse_board(img)
-                    fen = self.board_to_fen(board)
-                    print(f"  Re-parsed → {fen}")
-                    continue
+                    self._deselect_board()
+                    self._save_failure_diagnostics(
+                        "our_move_not_confirmed",
+                        {"before_move": before_move_img,
+                         "latest_observation": after_img},
+                        {"move": best, "tracked_fen": fen,
+                         "expected_fen": self.board_to_fen(expected_board)})
+                    print(f"  ERROR: move {best} was not confirmed; stopping safely.")
+                    return
+
+                board = expected_board
+                fen = self.board_to_fen(board)
+                last_board = [row[:] for row in board]
 
                 # Step 3: Wait for our turn (poll green border detection)
                 print("  Waiting...", end="", flush=True)
-                for wi in range(300):  # Up to ~90s
-                    if self.stop_flag:
-                        print(" stopped")
-                        return
-                    if self.is_my_turn():
-                        time.sleep(1.5)  # Let move animation finish
-                        break
-                    if wi % 10 == 0 and wi > 0:
-                        sys.stdout.write(".")
-                        sys.stdout.flush()
+                if not self.wait_for_our_turn():
+                    print(" timed out; no turn indicator detected")
+                    return
+                self._deselect_board()
+                stable_img = self._wait_for_board_stable()
+                if stable_img is None:
+                    self._save_failure_diagnostics(
+                        "board_never_stabilized",
+                        {"before_opponent_move": opponent_before_img,
+                         "latest_observation": self._last_stability_image},
+                        {"tracked_fen": fen})
+                    print(" ERROR: board animation did not stabilize; stopping.")
+                    return
                 print(" done")
 
-                # Step 4: Click empty area to deselect, then re-parse
-                river_x = self.cols_logical[4]
-                river_y = (self.rows_logical[4] + self.rows_logical[5]) / 2
-                self.click(river_x, river_y)
-                time.sleep(0.5)
-                img = self.screenshot_for_processing()
-                board = self.parse_board_cnn(img) if self.cnn else self.parse_board(img)
+                # Step 4: prefer an exact legal transition. If unrelated CNN
+                # cells are noisy, confirm the unique legal move from its two
+                # endpoints and their actual pixel changes.
+                opponent_side = 'b' if self.playing_red else 'w'
+                legal_moves = self.get_legal_moves(
+                    f"{fen} {opponent_side} - - 0 1")
+                observations = []
+                for observation_index in range(3):
+                    img = (stable_img if observation_index == 0
+                           else self.screenshot_for_processing())
+                    parsed = (self.parse_board_cnn(img)
+                              if self.cnn else self.parse_board(img))
+                    observed_move, matched = self._match_unique_legal_transition(
+                        last_board, parsed, legal_moves)
+                    grade = 'A'
+                    if not observed_move:
+                        observed_move, matched = \
+                            self._match_legal_transition_with_endpoint_changes(
+                                last_board, parsed, legal_moves,
+                                opponent_before_img, img)
+                        grade = 'B'
+                    observations.append((observed_move, matched, grade))
+                    time.sleep(0.25)
+                opponent_move, matched, state_confidence = \
+                    self._select_transition_consensus_with_confidence(
+                    observations)
+                if not opponent_move:
+                    self._save_failure_diagnostics(
+                        "opponent_consensus_failed",
+                        {"before_opponent_move": opponent_before_img,
+                         "latest_observation": img},
+                        {"tracked_fen": fen,
+                         "observations": [
+                             (move, self.board_to_fen(state) if state else None)
+                             for move, state, _grade in observations]})
+                    print("  ERROR: opponent move lacked multi-frame legal consensus; stopping.")
+                    return
+                board = matched
                 fen = self.board_to_fen(board)
+                print(f"  Verified opponent move: {opponent_move} "
+                      f"[confidence {state_confidence}]")
 
                 # Print board
                 print(f"  Board → {fen}")

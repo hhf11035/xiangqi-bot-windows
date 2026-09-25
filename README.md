@@ -1,6 +1,8 @@
 # Xiangqi Bot
 
-Auto-play Chinese chess (天天象棋) on macOS using Pikafish engine + CNN vision + screen automation.
+Auto-play Chinese chess (天天象棋) on Windows or macOS using Pikafish engine + CNN vision + screen automation.
+
+Windows adaptation of [yingwang/xiangqi-bot](https://github.com/yingwang/xiangqi-bot) by Ying Wang. The original MIT license and copyright notice are retained in [LICENSE](LICENSE). The Windows additions are described in [WINDOWS_PORT_NOTES.md](WINDOWS_PORT_NOTES.md).
 
 [中文](#天天象棋机器人)
 
@@ -10,20 +12,34 @@ Auto-play Chinese chess (天天象棋) on macOS using Pikafish engine + CNN visi
 2. **CNN classifier** (PyTorch, 15-class, 100% val accuracy) identifies pieces from screenshots
 3. **FEN validation** enforces piece count rules and auto-corrects misclassifications using confidence scores
 4. **Double-shot parsing** takes a second screenshot when confidence is low, averages probabilities to handle animation artifacts
-5. **Quartz CGEvent** clicks to execute moves
+5. **Platform input adapter** clicks to execute moves
 
 ```
 Screenshot → CNN parse board → FEN validation → Compare with tracked state → Detect opponent move
                   ↓                                                                ↓
           (low confidence?)                              Pikafish best move ← Current FEN
                   ↓                                                                ↓
-          2nd screenshot →                               CGEvent click → Execute move
+          2nd screenshot →                               Platform click → Execute move
           average probs
 ```
 
 ## Platform
 
-**macOS only.** The bot uses macOS-specific APIs (Quartz CGEvent for clicking, `screencapture` for screenshots). The included Pikafish binary is compiled for macOS x86_64 (runs on Apple Silicon via Rosetta).
+The CLI supports Windows 10/11 and macOS. Windows uses `mss`, Win32 window discovery, and `pyautogui`; macOS uses Quartz window discovery and `screencapture`. The AppKit GUI remains macOS-only.
+
+## Windows
+
+The CLI bot (`xiangqi_bot.py`) and multi-game supervisor (`continuous_play.py`) support Windows 10/11. CNN recognition, FEN validation, and the Pikafish UCI flow are unchanged. The macOS-only AppKit GUI (`app.py`) is not included in this port.
+
+1. Install 64-bit Python 3.11 or 3.12 and open PowerShell in this project folder.
+2. Run `powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1` once. It creates an isolated `.venv` and installs dependencies.
+3. A compatible Windows Pikafish 2026-01-02 executable (SSE4.1/POPCNT build) and its matching NNUE are included as `pikafish.exe` and `pikafish.nnue`. To use another build, set an absolute path: `$env:PIKAFISH_PATH = 'C:\\path\\to\\pikafish.exe'`.
+4. Open WeChat Desktop and its 天天象棋 mini-program in a normal, visible window. Do not minimize it. If WeChat keeps the mini-program embedded, this port captures the matching WeChat window; place it alone and resize it consistently before first calibration.
+5. Double-click `诊断.bat` first. If the window, screenshot, CNN, and Pikafish checks pass, start a game and double-click `启动单局.bat`. `启动连续对局.bat` enables the experimental automatic-rematch mode.
+
+Windows screenshots use `mss`; clicks and Escape use `pyautogui`, while window discovery/activation uses Win32 APIs. Coordinates are screen pixels, while calibration is saved relative to the detected window. Move the mouse to the upper-left corner to trigger PyAutoGUI's emergency stop. If your game window has a different title, set `XIANGQI_WINDOW_TITLE` to a unique part of its title before starting.
+
+`mss` captures the visible screen area occupied by the target window, so keep the board unminimized and unobstructed while the bot is running.
 
 ## Setup
 
@@ -37,7 +53,7 @@ pip install opencv-python numpy pyautogui torch torchvision
 
 Pikafish is a Chinese chess engine (forked from Stockfish, rewritten for xiangqi rules). It's a C++ compiled binary that the bot communicates with via UCI protocol over stdin/stdout.
 
-The repo includes a pre-built macOS x86_64 binary. If it doesn't work on your machine, build from source:
+The Windows delivery includes `pikafish.exe`; the following commands are only for building a macOS binary from source:
 
 ```bash
 git clone https://github.com/official-pikafish/Pikafish.git
@@ -175,11 +191,12 @@ python3 app.py
 | `xiangqi_bot.py` | Bot engine (game loop, move execution, double-shot parsing) |
 | `continuous_play.py` | Multi-game supervisor (auto-restart between games) |
 | `xiangqi_cnn.py` | CNN model, training, inference, FEN validation |
-| `xiangqi_cnn_onnx.py` | ONNX inference wrapper (no PyTorch needed) |
-| `xiangqi_cnn.onnx` | Trained model weights (ONNX format) |
-| `xiangqi_bot.spec` | PyInstaller build spec for macOS app |
-| `hook-cv2.py` | PyInstaller runtime hook for OpenCV |
-| `pikafish` | Pikafish engine binary (macOS x86_64) |
+| `platform_adapter.py` | Windows/macOS window, screenshot, and input adapter |
+| `windows_diagnostics.py` | Read-only Windows readiness diagnostics |
+| `requirements-windows.txt` | Windows Python dependencies |
+| `setup_windows.ps1` | Creates/repairs the Windows virtual environment |
+| `启动单局.bat` / `启动连续对局.bat` / `诊断.bat` | Windows launchers |
+| `pikafish.exe` | Bundled Windows Pikafish engine |
 | `pikafish.nnue` | Neural network evaluation file for Pikafish |
 | `cnn_data/` | Training data by piece type (`red_R/`, `black_r/`, `empty/`, etc.) |
 | `debug/` | Debug patches from latest game session |
@@ -192,13 +209,15 @@ python3 app.py
 
 This project's own code is released under the [MIT License](LICENSE).
 
-The bundled Pikafish engine binary (`pikafish`) and neural network weights (`pikafish.nnue`) are licensed under **GPL v3** (Pikafish is a fork of Stockfish). Source code: https://github.com/official-pikafish/Pikafish
+The bundled Pikafish engine binary (`pikafish.exe`) and neural network weights (`pikafish.nnue`) are licensed under **GPL v3** (Pikafish is a fork of Stockfish). Source code: https://github.com/official-pikafish/Pikafish
 
 ---
 
 # 天天象棋机器人
 
-macOS 平台下的天天象棋自动对局程序。基于 Pikafish 引擎、CNN 视觉识别与屏幕自动化实现。
+支持 Windows 10/11 与 macOS 的天天象棋自动对局程序。基于 Pikafish 引擎、CNN 视觉识别与屏幕自动化实现。
+
+本项目基于 Ying Wang 的 [xiangqi-bot](https://github.com/yingwang/xiangqi-bot) 增加 Windows 支持，保留原项目的 MIT 许可证与版权声明。Windows 改动见 [WINDOWS_PORT_NOTES.md](WINDOWS_PORT_NOTES.md)。
 
 ## 工作原理
 
@@ -206,11 +225,20 @@ macOS 平台下的天天象棋自动对局程序。基于 Pikafish 引擎、CNN 
 2. **CNN 分类器**（PyTorch，15 类，验证集 100% 准确率）从截图识别棋子
 3. **FEN 校验** 依据棋子数量规则，根据置信度自动修正误分类
 4. **双次采样** 置信度较低时二次截图，对概率取平均以应对动画瞬态
-5. **Quartz CGEvent** 模拟点击执行着法
+5. **平台输入适配层** 模拟点击执行着法
 
 ## 运行平台
 
-仅支持 macOS。依赖 Quartz CGEvent 与 `screencapture`。仓库内 Pikafish 二进制为 macOS x86_64 版本,Apple Silicon 设备通过 Rosetta 运行。
+命令行版本支持 Windows 10/11 与 macOS。Windows 使用 `mss`、Win32 窗口接口与 `pyautogui`；macOS 使用 Quartz 与 `screencapture`。`app.py` 的 AppKit 图形界面仍仅支持 macOS。
+
+### Windows 快速安装
+
+1. 安装 64 位 Python 3.11 或更高版本。
+2. 在项目目录运行 `powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1`。桌面交付版已经包含安装好的 `.venv`，通常无需再次安装。
+3. 打开电脑版微信中的天天象棋并保持棋盘窗口可见。
+4. 先双击 `诊断.bat`，通过后双击 `启动单局.bat`。实验性的连续对局使用 `启动连续对局.bat`。
+
+Windows 版已包含相互匹配的 `pikafish.exe` 与 `pikafish.nnue`。如要使用其他引擎，可设置 `PIKAFISH_PATH` 为该引擎的绝对路径，并将其匹配的 `pikafish.nnue` 放在同一目录。
 
 ## 安装
 
@@ -222,7 +250,7 @@ pip install opencv-python numpy pyautogui torch torchvision
 
 **2. Pikafish 引擎**
 
-Pikafish 为象棋引擎,由 Stockfish 衍生并针对象棋规则重写。仓库自带预编译的 macOS x86_64 二进制。如需自行编译:
+Pikafish 为象棋引擎,由 Stockfish 衍生并针对象棋规则重写。下方命令仅用于自行编译 macOS 版本；Windows 交付版已包含可执行文件:
 
 ```bash
 git clone https://github.com/official-pikafish/Pikafish.git
@@ -334,11 +362,12 @@ python3 app.py
 | `xiangqi_bot.py` | Bot 引擎(主循环、着法执行、双次采样) |
 | `continuous_play.py` | 连续对局监督脚本 |
 | `xiangqi_cnn.py` | CNN 模型、训练、推理、FEN 校验 |
-| `xiangqi_cnn_onnx.py` | ONNX 推理封装(无需 PyTorch) |
-| `xiangqi_cnn.onnx` | 训练权重(ONNX 格式) |
-| `xiangqi_bot.spec` | PyInstaller 构建规格 |
-| `hook-cv2.py` | OpenCV 的 PyInstaller 运行时 hook |
-| `pikafish` | Pikafish 引擎二进制(macOS x86_64) |
+| `platform_adapter.py` | Windows/macOS 窗口、截图与输入适配层 |
+| `windows_diagnostics.py` | 不执行点击的 Windows 就绪诊断 |
+| `requirements-windows.txt` | Windows Python 依赖 |
+| `setup_windows.ps1` | 创建或修复 Windows 隔离环境 |
+| `启动单局.bat` / `启动连续对局.bat` / `诊断.bat` | Windows 启动入口 |
+| `pikafish.exe` | 随附的 Windows Pikafish 引擎 |
 | `pikafish.nnue` | Pikafish 神经网络权重 |
 | `cnn_data/` | 按棋子类型组织的训练数据 |
 | `debug/` | 最近对局的 debug 样本 |

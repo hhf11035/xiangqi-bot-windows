@@ -4,3 +4,17 @@ screen.png
 
 # Training screenshots: tens of thousands of files, they do not belong in git.
 cnn_data/
+
+# Local Windows environment and diagnostics
+.venv/
+__pycache__/
+*.py[cod]
+_backup_before_initial_port_restore_*/
+故障诊断记录/
+continuous_play_debug/
+debug/
+calib.*-backup.json
+calib.invalid-*.json
+_probe.png
+_orientation_probe.png
+windows_diagnostic.png
